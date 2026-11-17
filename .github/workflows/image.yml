@@ -107,32 +107,17 @@ jobs:
             org.opencontainers.image.source=https://github.com/zkskaze/probable-octo-funicular
             org.opencontainers.image.version=${{ inputs.tag }}
 
-      - name: Publish release and Compose file
+      - name: Publish release
         env:
           DIGEST: ${{ steps.image.outputs.digest }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/release"
           cd "$RUNNER_TEMP/release"
-          cat > docker-compose.yml <<'COMPOSE'
-          services:
-            rekaze:
-              image: ghcr.io/zkskaze/probable-octo-funicular:latest
-              pull_policy: always
-              restart: unless-stopped
-              env_file:
-                - .env
-                - path: .env.local
-                  required: false
-              ports:
-                - "${PORT:-3000}:${PORT:-3000}"
-              volumes:
-                - ./novele:/app/novele
-          COMPOSE
           printf 'image=%s:%s\ndigest=%s\nplatforms=linux/amd64,linux/arm64\ncontext_sha256=%s\n' \
             "$IMAGE" "$TAG" "$DIGEST" "$EXPECTED_SHA256" > image.txt
-          sha256sum docker-compose.yml image.txt > checksums.txt
-          gh release upload "$TAG" docker-compose.yml image.txt checksums.txt --repo "$GITHUB_REPOSITORY" --clobber
+          sha256sum image.txt > checksums.txt
+          gh release upload "$TAG" image.txt checksums.txt --repo "$GITHUB_REPOSITORY" --clobber
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
           printf 'Published `%s:%s` and `latest` for AMD64 and ARM64.\n' "$IMAGE" "$TAG" >> "$GITHUB_STEP_SUMMARY"
 
