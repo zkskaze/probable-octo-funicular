@@ -1,0 +1,150 @@
+name: Build Docker image
+run-name: Docker ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        required: true
+      release_id:
+        description: Draft release containing the encrypted build context
+        required: true
+      context_secret:
+        description: Name of the temporary decryption secret
+        required: true
+      sha256:
+        description: Expected SHA-256 of the decrypted archive
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: publish-docker-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+      IMAGE: ghcr.io/zkskaze/probable-octo-funicular
+      DOCKER_BUILD_RECORD_UPLOAD: 'false'
+    steps:
+      - name: Validate release inputs
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9][A-Za-z0-9._-]{0,100}$ ]]
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            | jq -e --arg tag "$TAG" '.draft == true and .tag_name == $tag' >/dev/null
+
+      - name: Download and decrypt temporary build context
+        env:
+          CONTEXT_KEY: ${{ secrets[inputs.context_secret] }}
+        run: |
+          set -euo pipefail
+          test -n "$CONTEXT_KEY"
+          asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            --jq '.[] | select(.name == "build-context.enc") | .id')
+          [[ "$asset_id" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+            -H 'Accept: application/octet-stream' > "$RUNNER_TEMP/context.enc"
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { createDecipheriv, createHash } from 'node:crypto';
+          const encrypted = readFileSync(`${process.env.RUNNER_TEMP}/context.enc`);
+          const key = Buffer.from(process.env.CONTEXT_KEY.trim(), 'base64');
+          if (key.length !== 32 || encrypted.length < 29) throw new Error('Invalid encrypted context');
+          const decipher = createDecipheriv('aes-256-gcm', key, encrypted.subarray(0, 12));
+          decipher.setAuthTag(encrypted.subarray(12, 28));
+          const plain = Buffer.concat([decipher.update(encrypted.subarray(28)), decipher.final()]);
+          if (createHash('sha256').update(plain).digest('hex') !== process.env.EXPECTED_SHA256) throw new Error('Context checksum mismatch');
+          writeFileSync(`${process.env.RUNNER_TEMP}/context.tar.gz`, plain, { mode: 0o600 });
+          key.fill(0);
+          NODE
+          mkdir -p "$RUNNER_TEMP/context"
+          tar -tzf "$RUNNER_TEMP/context.tar.gz" | while IFS= read -r entry; do
+            case "$entry" in /*|../*|*/../*) echo 'Unsafe context path' >&2; exit 1 ;; esac
+          done
+          tar -xzf "$RUNNER_TEMP/context.tar.gz" --no-same-owner -C "$RUNNER_TEMP/context"
+          # Remove the encrypted upload before the release is published.
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish AMD64 and ARM64
+        id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/context
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/zkskaze/probable-octo-funicular:${{ inputs.tag }}
+            ghcr.io/zkskaze/probable-octo-funicular:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/zkskaze/probable-octo-funicular
+            org.opencontainers.image.version=${{ inputs.tag }}
+
+      - name: Publish release and Compose file
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/release"
+          cat > docker-compose.yml <<'COMPOSE'
+          services:
+            rekaze:
+              image: ghcr.io/zkskaze/probable-octo-funicular:latest
+              pull_policy: always
+              restart: unless-stopped
+              env_file:
+                - .env
+                - path: .env.local
+                  required: false
+              ports:
+                - "${PORT:-3000}:${PORT:-3000}"
+              volumes:
+                - ./novele:/app/novele
+          COMPOSE
+          printf 'image=%s:%s\ndigest=%s\nplatforms=linux/amd64,linux/arm64\ncontext_sha256=%s\n' \
+            "$IMAGE" "$TAG" "$DIGEST" "$EXPECTED_SHA256" > image.txt
+          sha256sum docker-compose.yml image.txt > checksums.txt
+          gh release upload "$TAG" docker-compose.yml image.txt checksums.txt --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          printf 'Published `%s:%s` and `latest` for AMD64 and ARM64.\n' "$IMAGE" "$TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary build files and any remaining encrypted upload
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
+            asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+              --jq '.[] | select(.name == "build-context.enc") | .id')
+            if [[ "$asset_id" =~ ^[0-9]+$ ]]; then
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            fi
+          fi
+          rm -rf -- "$RUNNER_TEMP/context" "$RUNNER_TEMP/context.enc" "$RUNNER_TEMP/context.tar.gz"
