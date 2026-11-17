@@ -1,0 +1,103 @@
+name: Build and release Docker image
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release metadata
+        uses: actions/checkout@v4
+
+      - name: Connect to Caelid over Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          tags: tag:github-actions
+
+      - name: Prepare SSH access
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.CAELID_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY" || { echo "Missing CAELID_SSH_PRIVATE_KEY secret" >&2; exit 1; }
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          for attempt in {1..10}; do
+            ssh-keyscan -T 5 -H 100.68.187.8 >> "$HOME/.ssh/known_hosts" 2>/dev/null && break || sleep 2
+          done
+          test -s "$HOME/.ssh/known_hosts"
+
+      - name: Fetch source context from Caelid
+        id: source
+        run: |
+          set -euo pipefail
+          ssh_opts=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15)
+          source_sha=$(ssh "${ssh_opts[@]}" saint@100.68.187.8 'git -C /home/saint/KazeRE rev-parse HEAD')
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/kazere-context"
+          ssh "${ssh_opts[@]}" saint@100.68.187.8 \
+            'cd /home/saint/KazeRE && tar -czf - --exclude=.git --exclude=.gitea --exclude=.github --exclude=.env --exclude=.env\* --exclude=.convex-neon-migration.json --exclude=snapshot_rightful-lemur-711_1794925423839478859.zip --exclude=node_modules --exclude=build --exclude=dist --exclude=.svelte-kit --exclude=novele --exclude=scratch --exclude=mobile --exclude=.auth-verify --exclude=.convex-ui-check .' \
+            | tar -xzf - -C "$RUNNER_TEMP/kazere-context"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/zkskaze/probable-octo-funicular
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+
+      - name: Build and publish multi-platform image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/kazere-context
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=https://github.com/zkskaze/probable-octo-funicular
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ghcr.io/zkskaze/probable-octo-funicular
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          printf 'image=%s:%s\ndigest=%s\nsource_revision=%s\n' \
+            "$IMAGE" "$GITHUB_REF_NAME" "$IMAGE_DIGEST" "$SOURCE_SHA" > release-image.txt
+          gh release create "$GITHUB_REF_NAME" release-image.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --notes "Multi-platform Docker image: $IMAGE:$GITHUB_REF_NAME"
